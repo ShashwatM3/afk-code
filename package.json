@@ -1,6 +1,6 @@
 {
   "name": "afk-code",
-  "version": "0.3.1",
+  "version": "0.3.1-pa.1",
   "description": "Monitor and interact with Claude Code sessions from Slack/Discord/Telegram",
   "author": "Colin Harman",
   "repository": {
@@ -36,7 +36,7 @@
     "cli"
   ],
   "license": "MIT",
-"dependencies": {
+  "dependencies": {
     "@slack/bolt": "^4.6.0",
     "discord.js": "^14.25.1",
     "grammy": "^1.35.0",
