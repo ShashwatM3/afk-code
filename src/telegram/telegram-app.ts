@@ -2,7 +2,15 @@ import { Bot, Context, InputFile } from 'grammy';
 import type { TelegramConfig } from './types.js';
 import { SessionManager, type SessionInfo } from '../slack/session-manager.js';
 import { chunkMessage, formatTodos } from '../slack/message-formatter.js';
-import { extractImagePaths } from '../utils/image-extractor.js';
+import { extractMediaPaths } from '../utils/image-extractor.js';
+import { createBridge } from './bridge.js';
+import { readFile } from 'fs/promises';
+import {
+  describeFile,
+  describeVoiceNote,
+  downloadTelegramFile,
+  transcribeWithDeepgram,
+} from './inbound-media.js';
 
 // Telegram has a 4096 character limit per message
 const MAX_MESSAGE_LENGTH = 4000;
@@ -20,6 +28,7 @@ export function createTelegramApp(config: TelegramConfig) {
   const activeSessions = new Map<string, SessionTracking>();
   const telegramSentMessages = new Set<string>();
   let currentSessionId: string | null = null; // Explicitly selected session
+  let bridge: ReturnType<typeof createBridge> | null = null;
 
   // Message queue for rate limiting (Telegram allows ~30 msg/sec but be conservative)
   const messageQueue: Array<() => Promise<void>> = [];
@@ -137,6 +146,7 @@ export function createTelegramApp(config: TelegramConfig) {
       tracking.lastActivity = new Date();
 
       if (role === 'user') {
+        bridge?.broadcast({ type: 'user', sessionId, content });
         const contentKey = content.trim();
         if (telegramSentMessages.has(contentKey)) {
           telegramSentMessages.delete(contentKey);
@@ -144,29 +154,29 @@ export function createTelegramApp(config: TelegramConfig) {
         }
         await sendChunkedMessage(content, `_User (terminal):_`, { disable_notification: true });
       } else {
+        bridge?.broadcast({ type: 'assistant', sessionId, content });
         await sendChunkedMessage(content, `_Claude Code:_`);
 
-        // Extract and upload any images mentioned in the response
+        // Extract and upload any images, audio, video or PDFs mentioned in the response
         const session = sessionManager.getSession(sessionId);
-        const images = extractImagePaths(content, session?.cwd);
-        for (const image of images) {
+        const media = extractMediaPaths(content, session?.cwd);
+        for (const item of media) {
           try {
-            console.log(`[Telegram] Uploading image: ${image.resolvedPath}`);
-            const isGif = image.resolvedPath.toLowerCase().endsWith('.gif');
+            console.log(`[Telegram] Uploading ${item.kind}: ${item.resolvedPath}`);
             messageQueue.push(async () => {
-              if (isGif) {
-                await bot.api.sendAnimation(config.chatId, new InputFile(image.resolvedPath), {
-                  caption: `📎 ${image.originalPath}`,
-                });
-              } else {
-                await bot.api.sendPhoto(config.chatId, new InputFile(image.resolvedPath), {
-                  caption: `📎 ${image.originalPath}`,
-                });
+              const file = new InputFile(item.resolvedPath);
+              const opts = { caption: `📎 ${item.originalPath}` };
+              switch (item.kind) {
+                case 'animation': await bot.api.sendAnimation(config.chatId, file, opts); break;
+                case 'audio': await bot.api.sendAudio(config.chatId, file, opts); break;
+                case 'video': await bot.api.sendVideo(config.chatId, file, opts); break;
+                case 'document': await bot.api.sendDocument(config.chatId, file, opts); break;
+                default: await bot.api.sendPhoto(config.chatId, file, opts);
               }
             });
             processQueue();
           } catch (err) {
-            console.error('[Telegram] Failed to upload image:', err);
+            console.error('[Telegram] Failed to upload media:', err);
           }
         }
       }
@@ -237,6 +247,90 @@ export function createTelegramApp(config: TelegramConfig) {
     return mostRecent;
   }
 
+  bridge = createBridge({
+    currentSessionId: () => getCurrentSession()?.sessionId ?? null,
+    listSessions: () => Array.from(activeSessions.values()),
+    sendInput: (sessionId, text) => {
+      telegramSentMessages.add(text.trim());
+      const sent = sessionManager.sendInput(sessionId, text);
+      if (!sent) telegramSentMessages.delete(text.trim());
+      return sent;
+    },
+    port: config.bridgePort,
+  });
+
+  // Forward text to the current session, replying when there is none to receive it.
+  async function forwardToSession(ctx: Context, text: string, what: string): Promise<boolean> {
+    const current = getCurrentSession();
+    if (!current) {
+      await ctx.reply(`No active session to receive the ${what}.`);
+      return false;
+    }
+    telegramSentMessages.add(text.trim());
+    const sent = sessionManager.sendInput(current.sessionId, text);
+    if (!sent) {
+      telegramSentMessages.delete(text.trim());
+      await ctx.reply('Failed to send input - session not connected.');
+    }
+    return sent;
+  }
+
+  // Photos and documents: save to the inbox and tell the session where the file is
+  bot.on(['message:photo', 'message:document'], async (ctx) => {
+    if (ctx.chat.id.toString() !== config.chatId) return;
+    if (!getCurrentSession()) {
+      await ctx.reply('No active session to receive the file.');
+      return;
+    }
+    try {
+      const msg = ctx.message;
+      const photo = msg.photo ? msg.photo[msg.photo.length - 1] : null;
+      const fileId = photo ? photo.file_id : msg.document!.file_id;
+      const saved = await downloadTelegramFile(ctx.api, config.botToken, fileId, msg.document?.file_name, photo ? '.jpg' : '');
+      const text = describeFile(ctx, saved, !!photo);
+      if (await forwardToSession(ctx, text, 'file')) {
+        console.log(`[Telegram] Forwarded ${photo ? 'image' : 'file'} to session: ${saved.path}`);
+      }
+    } catch (err: any) {
+      console.error('[Telegram] Failed to receive file:', err);
+      await ctx.reply(`Could not receive the file: ${err.message}`);
+    }
+  });
+
+  // Voice notes and audio: save, transcribe with Deepgram when a key is configured, forward the text
+  bot.on(['message:voice', 'message:audio'], async (ctx) => {
+    if (ctx.chat.id.toString() !== config.chatId) return;
+    if (!getCurrentSession()) {
+      await ctx.reply('No active session to receive the voice note.');
+      return;
+    }
+    try {
+      const msg = ctx.message;
+      const media = msg.voice ?? msg.audio!;
+      const mime = media.mime_type || (msg.voice ? 'audio/ogg' : 'audio/mpeg');
+      const saved = await downloadTelegramFile(ctx.api, config.botToken, media.file_id, (msg.audio as any)?.file_name, msg.voice ? '.oga' : '.mp3');
+      let transcript: string | null = null;
+      try {
+        transcript = await transcribeWithDeepgram(config.deepgramApiKey, await readFile(saved.path), mime);
+      } catch (err: any) {
+        console.error('[Telegram] Transcription failed:', err.message);
+      }
+      if (transcript === null && !config.deepgramApiKey) {
+        await ctx.reply('Voice notes need DEEPGRAM_API_KEY (in ~/.afk-code/voice.env or telegram.env); forwarding the audio file path instead.');
+      } else if (transcript === '') {
+        await ctx.reply('I could not make out any words in that voice note.');
+        return;
+      }
+      const text = describeVoiceNote(ctx, saved, transcript);
+      if (await forwardToSession(ctx, text, 'voice note')) {
+        console.log(`[Telegram] Forwarded voice note to session (${transcript ? transcript.length + ' chars' : 'untranscribed'})`);
+      }
+    } catch (err: any) {
+      console.error('[Telegram] Failed to receive voice note:', err);
+      await ctx.reply(`Could not receive the voice note: ${err.message}`);
+    }
+  });
+
   // Handle incoming messages
   bot.on('message:text', async (ctx) => {
     // Only respond to messages from the configured chat
@@ -299,9 +393,11 @@ export function createTelegramApp(config: TelegramConfig) {
       case '/start': {
         await ctx.reply(
           `*AFK Code Telegram Bot*\n\n` +
-            `This bot lets you monitor and interact with Claude Code sessions.\n\n` +
-            `Start a session with:\n` +
-            `\`afk-code run -- claude\`\n\n` +
+            `This bot relays a Claude Code session running on your computer. ` +
+            `Anything you type here is sent to that session and its replies come back here.\n\n` +
+            `You can also send photos, files (PDFs), and voice notes; they are saved on the computer ` +
+            `and described to the session (voice notes are transcribed).\n\n` +
+            `Start a session on the computer with \`afk-code claude\` (or your own launcher, e.g. \`telegram-claude\`).\n\n` +
             `Type /help for available commands.`,
           { parse_mode: 'Markdown' }
         );
@@ -423,7 +519,8 @@ export function createTelegramApp(config: TelegramConfig) {
             `/interrupt - Send Escape\n` +
             `/mode - Toggle mode (Shift+Tab)\n` +
             `/help - Show this message\n\n` +
-            `_Messages go to the current session (auto-selected if only one)._`,
+            `_Messages go to the current session (auto-selected if only one)._\n` +
+            `_Photos, files and voice notes are forwarded to it too._`,
           { parse_mode: 'Markdown' }
         );
         break;

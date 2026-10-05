@@ -120,6 +120,15 @@ export async function telegramRun(): Promise<void> {
   if (process.env.TELEGRAM_BOT_TOKEN) config.TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   if (process.env.TELEGRAM_CHAT_ID) config.TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
+  // Optional Deepgram key for voice-note transcription: env, then telegram.env/.env,
+  // then ~/.afk-code/voice.env (shared with other local tools).
+  if (process.env.DEEPGRAM_API_KEY) config.DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+  if (!config.DEEPGRAM_API_KEY) {
+    const voiceConfig = await loadEnvFile(`${CONFIG_DIR}/voice.env`);
+    if (voiceConfig.DEEPGRAM_API_KEY) config.DEEPGRAM_API_KEY = voiceConfig.DEEPGRAM_API_KEY;
+  }
+  if (process.env.AFK_BRIDGE_PORT) config.AFK_BRIDGE_PORT = process.env.AFK_BRIDGE_PORT;
+
   // Validate required config
   const required = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'];
   const missing = required.filter((key) => !config[key]);
@@ -139,7 +148,10 @@ export async function telegramRun(): Promise<void> {
   const telegramConfig = {
     botToken: config.TELEGRAM_BOT_TOKEN,
     chatId: config.TELEGRAM_CHAT_ID,
+    deepgramApiKey: config.DEEPGRAM_API_KEY || undefined,
+    bridgePort: config.AFK_BRIDGE_PORT ? Number(config.AFK_BRIDGE_PORT) : undefined,
   };
+  console.log(`[AFK Code] Voice-note transcription: ${telegramConfig.deepgramApiKey ? 'Deepgram' : 'off (no DEEPGRAM_API_KEY)'}`);
 
   const { bot, sessionManager } = createTelegramApp(telegramConfig);
 

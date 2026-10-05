@@ -101,15 +101,32 @@ export async function run(command: string[]): Promise<void> {
     env: process.env as Record<string, string>,
   });
 
-  const daemon = await connectToDaemon(
-    sessionId,
-    projectDir,
-    cwd,
-    command,
-    (text) => {
-      ptyProcess.write(text);
+  // Remote input is written in small ordered chunks. A macOS pty holds about 1 KB of
+  // unread input and discards the whole queue on overflow, so one large write of a
+  // long Telegram message would lose its beginning. The queue also keeps the Enter
+  // that follows a message behind its last chunk.
+  const INPUT_CHUNK = 256;
+  const INPUT_PAUSE_MS = 30;
+  const inputQueue: string[] = [];
+  let draining = false;
+  const drainInput = () => {
+    const next = inputQueue.shift();
+    if (next === undefined) {
+      draining = false;
+      return;
     }
-  );
+    ptyProcess.write(next);
+    setTimeout(drainInput, inputQueue.length ? INPUT_PAUSE_MS : 0);
+  };
+  const queueInput = (text: string) => {
+    for (let i = 0; i < text.length; i += INPUT_CHUNK) inputQueue.push(text.slice(i, i + INPUT_CHUNK));
+    if (!draining) {
+      draining = true;
+      drainInput();
+    }
+  };
+
+  const daemon = await connectToDaemon(sessionId, projectDir, cwd, command, queueInput);
 
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true);

@@ -7,27 +7,55 @@ const IMAGE_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico', '.tiff', '.tif'
 ]);
 
+// Audio, video and document extensions that Telegram can receive as files
+const AUDIO_EXTENSIONS = new Set(['.m4a', '.mp3', '.wav', '.ogg']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.webm']);
+const DOCUMENT_EXTENSIONS = new Set(['.pdf']);
+
+const IMAGE_EXT_RE = 'png|jpe?g|gif|webp|svg|bmp|ico|tiff?';
+const MEDIA_EXT_RE = `${IMAGE_EXT_RE}|m4a|mp3|wav|ogg|mp4|mov|webm|pdf`;
+
 // Regex to match file paths that could be images
 // Matches: /absolute/path.png, ./relative/path.jpg, ~/home/path.gif, "quoted/path.png"
-const PATH_PATTERN = /(?:["'`]([^"'`\n]+\.(?:png|jpe?g|gif|webp|svg|bmp|ico|tiff?))|(?:^|[\s(])([~./][^\s)"'`\n]*\.(?:png|jpe?g|gif|webp|svg|bmp|ico|tiff?)))/gi;
+function pathPattern(ext: string): RegExp {
+  return new RegExp(
+    `(?:["'\`]([^"'\`\\n]+\\.(?:${ext}))|(?:^|[\\s(])([~./][^\\s)"'\`\\n]*\\.(?:${ext})))`,
+    'gi'
+  );
+}
+const PATH_PATTERN = pathPattern(IMAGE_EXT_RE);
+const MEDIA_PATH_PATTERN = pathPattern(MEDIA_EXT_RE);
+
+export type MediaKind = 'image' | 'animation' | 'audio' | 'video' | 'document';
 
 export interface ExtractedImage {
   originalPath: string;
   resolvedPath: string;
 }
 
-/**
- * Extract image paths from text content and verify they exist on disk
- */
-export function extractImagePaths(content: string, cwd?: string): ExtractedImage[] {
-  const images: ExtractedImage[] = [];
+export interface ExtractedMedia extends ExtractedImage {
+  kind: MediaKind;
+}
+
+export function mediaKind(resolvedPath: string): MediaKind | null {
+  const ext = resolvedPath.toLowerCase().slice(resolvedPath.lastIndexOf('.'));
+  if (ext === '.gif') return 'animation';
+  if (ext === '.svg' || DOCUMENT_EXTENSIONS.has(ext)) return 'document';
+  if (IMAGE_EXTENSIONS.has(ext)) return 'image';
+  if (AUDIO_EXTENSIONS.has(ext)) return 'audio';
+  if (VIDEO_EXTENSIONS.has(ext)) return 'video';
+  return null;
+}
+
+function extractPaths(pattern: RegExp, content: string, cwd: string | undefined, accept: (ext: string) => boolean): ExtractedImage[] {
+  const found: ExtractedImage[] = [];
   const seen = new Set<string>();
 
   // Reset regex state
-  PATH_PATTERN.lastIndex = 0;
+  pattern.lastIndex = 0;
 
   let match;
-  while ((match = PATH_PATTERN.exec(content)) !== null) {
+  while ((match = pattern.exec(content)) !== null) {
     // Get the captured path (from quoted or unquoted group)
     const originalPath = (match[1] || match[2]).trim();
 
@@ -58,8 +86,8 @@ export function extractImagePaths(content: string, cwd?: string): ExtractedImage
         if (stat.isFile()) {
           // Check extension
           const ext = resolvedPath.toLowerCase().slice(resolvedPath.lastIndexOf('.'));
-          if (IMAGE_EXTENSIONS.has(ext)) {
-            images.push({ originalPath, resolvedPath });
+          if (accept(ext)) {
+            found.push({ originalPath, resolvedPath });
           }
         }
       }
@@ -68,5 +96,20 @@ export function extractImagePaths(content: string, cwd?: string): ExtractedImage
     }
   }
 
-  return images;
+  return found;
+}
+
+/**
+ * Extract image paths from text content and verify they exist on disk
+ */
+export function extractImagePaths(content: string, cwd?: string): ExtractedImage[] {
+  return extractPaths(PATH_PATTERN, content, cwd, (ext) => IMAGE_EXTENSIONS.has(ext));
+}
+
+/**
+ * Extract image, audio, video and PDF paths from text content and verify they exist on disk
+ */
+export function extractMediaPaths(content: string, cwd?: string): ExtractedMedia[] {
+  return extractPaths(MEDIA_PATH_PATTERN, content, cwd, (ext) => mediaKind(`x${ext}`) !== null)
+    .map((m) => ({ ...m, kind: mediaKind(m.resolvedPath) as MediaKind }));
 }
